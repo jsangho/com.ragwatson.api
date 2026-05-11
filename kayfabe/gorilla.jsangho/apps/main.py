@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from titanic.app.james import James
+from titanic.app.james_controller import JamesController
 
 from doro.app.doro_director import DoroDirector
 
@@ -12,31 +12,42 @@ def read_root():
 
 @app.get("/titanic/data")
 def read_titanic_data():
-    james = James()
+    james = JamesController()
     df = james.get_data()
 
     return df.to_dict(orient="records")
 
 @app.get("/titanic/count")
 def read_titanic_count():
-    james = James()
+    james = JamesController()
     df = james.get_count()
 
     return df.to_dict(orient="records")
 
 @app.get("/titanic/count/survived")
 def read_titanic_count_survived():
-    james = James()
+    james = JamesController()
     df = james.get_count_survived()
 
     return df.to_dict(orient="records")
 
 @app.get("/titanic/count/dead")
 def read_titanic_count_dead():
-    james = James()
+    james = JamesController()
     df = james.get_count_dead()
 
     return df.to_dict(orient="records")
+
+@app.get("/titanic/tree")
+def read_titanic_tree():
+    james = JamesController()
+    has_model = james.has_decision_tree_model()
+    return {"model": "titanic_decision_tree", "exists": bool(has_model)}
+
+@app.get("/titanic/model")
+def read_titanic_model():
+    james = JamesController()
+    return {"model_name": james.get_model_name()}
 
 
 @app.get("/doro/data")
