@@ -1,22 +1,41 @@
+import asyncio
+import json
 import logging
+import sys
 from contextlib import asynccontextmanager
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from adapters.db_health_adapter import DbHealthAdapter
-from database import dispose_engine, get_db, init_db
+from database import (
+    AsyncSessionLocal,
+    configure_db_logging,
+    dispose_engine,
+    get_db,
+    init_db,
+)
 from doro.app.doro_director import DoroDirector
 from matrix.app.keymaker import get_keymaker
 from secom.app.models.role import UserRole
 from secom.app.schemas.user_schema import UserSchema
 from secom.app.controllers.user_controller import UserController
 from titanic.app.james_controller import JamesController
-
+from kayfabe.app.controllers.ple_controller import PleController
+from kayfabe.app.schemas.ple_schema import (
+    MatchResultUpdateSchema,
+    PleBoardSchema,
+    PleEventSummarySchema,
+    PleEventSyncSchema,
+    PredictionRequestSchema,
+)
 keymaker = get_keymaker()
 logger = logging.getLogger("uvicorn.error")
 
@@ -39,6 +58,9 @@ class SeoulWeatherResponse(BaseModel):
 
 
 class SignupRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: str = Field(..., alias="userId", min_length=1, description="회원가입 ID")
     nickname: str = Field(..., min_length=1, description="회원가입 닉네임")
     email: str = Field(..., min_length=1, description="회원가입 이메일")
     password: str = Field(..., min_length=1, description="회원가입 비밀번호")
@@ -54,13 +76,26 @@ class SignupResponse(BaseModel):
     message: str
     nickname: str
     email: str
-    password: str
-    password_confirm: str
+    role: UserRole
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: str = Field(..., alias="userId", min_length=1, description="로그인 ID")
+    password: str = Field(..., min_length=1, description="로그인 비밀번호")
+
+
+class LoginResponse(BaseModel):
+    message: str
+    nickname: str
+    email: str
     role: UserRole
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_db_logging()
     try:
         await init_db()
         yield
@@ -208,23 +243,12 @@ def read_doro_data():
     return df.to_dict(orient="records")
 
 #회원가입
-@app.post("/signup")
-def signup(req: SignupRequest):
-    logger.info(
-        "\n"
-        "========== 회원가입 요청 ==========\n"
-        "nickname=%s\n"
-        "email=%s\n"
-        "password=%s\n"
-        "passwordConfirm=%s\n"
-        "================================",
-        req.nickname,
-        req.email,
-        req.password,
-        req.password_confirm,
-    )
+@app.post("/signup", response_model=SignupResponse)
+async def signup(req: SignupRequest, db: AsyncSession = Depends(get_db)):
+    logger.info("[API] signup 요청 — userId=%s", req.user_id)
 
     user_schema = UserSchema(
+        login_id=req.user_id.strip(),
         nickname=req.nickname,
         email=req.email,
         password=req.password,
@@ -232,16 +256,152 @@ def signup(req: SignupRequest):
         role=UserRole.USER,
     )
 
-    user_controller = UserController()
-    user_controller.save_user(user_schema)
+    user_controller = UserController(db)
+    await user_controller.save_user(user_schema)
 
     return SignupResponse(
-        message="회원가입 값이 서버로 전달되었습니다.",
+        message="회원가입이 완료되었습니다.",
         nickname=req.nickname,
         email=req.email,
-        password=req.password,
-        password_confirm=req.password_confirm,
         role=UserRole.USER,
+    )
+
+
+@app.get("/ple", response_model=list[PleEventSummarySchema])
+async def list_ple_events(db: AsyncSession = Depends(get_db)):
+    return await PleController(db).list_events()
+
+
+@app.get("/ple/{slug}", response_model=PleBoardSchema, response_model_by_alias=True)
+async def get_ple_board(
+    slug: str,
+    client_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await PleController(db).get_board(slug, client_id=client_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="PLE not found") from None
+
+
+@app.post("/ple/sync", response_model=PleBoardSchema, response_model_by_alias=True)
+async def sync_ple_event(payload: PleEventSyncSchema, db: AsyncSession = Depends(get_db)):
+    return await PleController(db).sync_event(payload)
+
+
+@app.post(
+    "/ple/{slug}/sync-from-client",
+    response_model=PleBoardSchema,
+    response_model_by_alias=True,
+)
+async def sync_ple_from_client_cards(
+    slug: str,
+    payload: PleEventSyncSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    if payload.slug != slug:
+        raise HTTPException(status_code=400, detail="slug in path and body must match")
+    return await PleController(db).sync_event(payload)
+
+
+@app.post(
+    "/ple/{slug}/matches/{match_key}/predict",
+    response_model=PleBoardSchema,
+    response_model_by_alias=True,
+)
+async def ple_predict(
+    slug: str,
+    match_key: str,
+    body: PredictionRequestSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await PleController(db).predict(slug, match_key, body)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="PLE or match not found") from None
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@app.patch(
+    "/ple/{slug}/matches/{match_key}/result",
+    response_model=PleBoardSchema,
+    response_model_by_alias=True,
+)
+async def ple_set_result(
+    slug: str,
+    match_key: str,
+    body: MatchResultUpdateSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await PleController(db).set_result(slug, match_key, body)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="PLE or match not found") from None
+
+
+@app.post("/ple/{slug}/finalize", response_model=PleBoardSchema, response_model_by_alias=True)
+async def ple_finalize(slug: str, db: AsyncSession = Depends(get_db)):
+    try:
+        return await PleController(db).finalize(slug)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="PLE not found") from None
+
+
+@app.get("/ple/{slug}/live")
+async def ple_live_board(slug: str, client_id: str | None = None):
+    """SSE — 투표·결과 변경 시 3초 주기로 보드 스냅샷 전송."""
+
+    if AsyncSessionLocal is None:
+        raise HTTPException(
+            status_code=503,
+            detail="DATABASE_URL이 설정되지 않았습니다.",
+        )
+
+    async def event_stream():
+        last_payload: str | None = None
+        while True:
+            async with AsyncSessionLocal() as session:
+                try:
+                    board = await PleController(session).get_board(slug, client_id=client_id)
+                    await session.commit()
+                except LookupError:
+                    yield f"data: {json.dumps({'error': 'not_found'})}\n\n"
+                    break
+                except Exception as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    await asyncio.sleep(3)
+                    continue
+
+            payload = json.dumps(
+                board.model_dump(mode="json", by_alias=True),
+                default=str,
+            )
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+            await asyncio.sleep(3)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/login", response_model=LoginResponse)
+async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
+    login_id = req.user_id.strip()
+    logger.info("[API] login 요청 — userId=%s", login_id)
+
+    user_controller = UserController(db)
+    user = await user_controller.login_user(login_id, req.password)
+
+    return LoginResponse(
+        message="로그인되었습니다.",
+        nickname=user.nickname,
+        email=user.email,
+        role=UserRole(user.role),
     )
 
 

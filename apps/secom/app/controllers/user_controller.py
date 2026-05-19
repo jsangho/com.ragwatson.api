@@ -1,28 +1,27 @@
-import logging
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from database import APP_LOGGER
+from secom.app.models.user_model import UserModel
 from secom.app.schemas.user_schema import UserSchema
 from secom.app.services.user_service import UserService
 
-logger = logging.getLogger("uvicorn.error")
+logger = APP_LOGGER
 
 
-def _schema_values(user_schema: UserSchema):
-    return user_schema.model_dump() if hasattr(user_schema, "model_dump") else user_schema.dict()
+class UserController(object):
+    def __init__(self, db: AsyncSession) -> None:
+        self.user_service = UserService(db)
 
-
-class UserController:
-
-    def __init__(self):
-        pass
-
-    def save_user(self, user_schema: UserSchema):
+    async def save_user(self, user_schema: UserSchema) -> None:
         logger.info(
-            "\n"
-            "========== UserController.save_user ==========\n"
-            "현재 레이어: controller\n"
-            "user_schema=%s\n"
-            "============================================",
-            _schema_values(user_schema),
+            "[UserController] save_user 레이어 완료 — userId=%s",
+            user_schema.login_id,
         )
-        user_service = UserService()
-        user_service.save_user(user_schema)
+        await self.user_service.save_user(user_schema)
+
+    async def login_user(self, login_id: str, password: str) -> UserModel:
+        logger.info(
+            "[UserController] login_user 레이어 완료 — userId=%s",
+            login_id,
+        )
+        return await self.user_service.login_user(login_id, password)
