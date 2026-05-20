@@ -10,11 +10,12 @@
 
 | 문서 | 용도 |
 |------|------|
+| [`../docs/README.md`](../docs/README.md) | **업무별 코딩 규칙 인덱스**(Frontend/Backend). 구현 전 필수. |
 | [`CLAUDE.md`](CLAUDE.md) | 위 원칙의 **전체** 한글판(Think Before Coding, 단순성, 정밀 수정, 목표 중심 실행). |
-| [`.cursorrules`](.cursorrules) | Cursor가 매 세션 읽는 **짧은 레일**(같은 네 축을 압축). |
+| [`.cursorrules`](.cursorrules) | Cursor가 매 세션 읽는 **짧은 레일** + **`docs/` 읽기 의무**. |
 | [`CURSOR.md`](CURSOR.md) | Cursor에서 `@` 컨텍스트·우선순위 등 **IDE에 붙이는 방법**. |
 
-새 기여자는 **이 README → `CURSOR.md` → `CLAUDE.md`** 순으로 읽으면 하네스 전체를 잡을 수 있다.
+새 기여자는 **이 README → `../docs/README.md` → `CURSOR.md` → `CLAUDE.md`** 순으로 읽으면 하네스 전체를 잡을 수 있다.
 
 ---
 
