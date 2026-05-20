@@ -1,13 +1,16 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
 if sys.platform == "win32":
+    # Anaconda(numpy/scipy) + uvicorn --reload 종료 시 forrtl error (200) 방지
+    os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -17,8 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from adapters.db_health_adapter import DbHealthAdapter
 from database import (
     AsyncSessionLocal,
+    attach_neon_sql_logging,
     configure_db_logging,
     dispose_engine,
+    engine,
     get_db,
     init_db,
 )
@@ -28,14 +33,7 @@ from secom.app.models.role import UserRole
 from secom.app.schemas.user_schema import UserSchema
 from secom.app.controllers.user_controller import UserController
 from titanic.app.james_controller import JamesController
-from kayfabe.app.controllers.ple_controller import PleController
-from kayfabe.app.schemas.ple_schema import (
-    MatchResultUpdateSchema,
-    PleBoardSchema,
-    PleEventSummarySchema,
-    PleEventSyncSchema,
-    PredictionRequestSchema,
-)
+
 keymaker = get_keymaker()
 logger = logging.getLogger("uvicorn.error")
 
@@ -96,6 +94,8 @@ class LoginResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_db_logging()
+    if engine is not None:
+        attach_neon_sql_logging(engine)
     try:
         await init_db()
         yield
@@ -112,6 +112,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_auth_requests(request: Request, call_next):
+    """로그인·회원가입 요청이 들어오면 uvicorn 터미널에 먼저 표시합니다."""
+    if request.url.path in ("/login", "/signup") and request.method == "POST":
+        logger.info("[API] %s %s", request.method, request.url.path)
+    return await call_next(request)
+
 
 @app.get("/")
 def read_root():
@@ -245,8 +254,7 @@ def read_doro_data():
 #회원가입
 @app.post("/signup", response_model=SignupResponse)
 async def signup(req: SignupRequest, db: AsyncSession = Depends(get_db)):
-    logger.info("[API] signup 요청 — userId=%s", req.user_id)
-
+    logger.info("[API] POST /signup — userId=%s", req.user_id)
     user_schema = UserSchema(
         login_id=req.user_id.strip(),
         nickname=req.nickname,
@@ -267,132 +275,10 @@ async def signup(req: SignupRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
-@app.get("/ple", response_model=list[PleEventSummarySchema])
-async def list_ple_events(db: AsyncSession = Depends(get_db)):
-    return await PleController(db).list_events()
-
-
-@app.get("/ple/{slug}", response_model=PleBoardSchema, response_model_by_alias=True)
-async def get_ple_board(
-    slug: str,
-    client_id: str | None = None,
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        return await PleController(db).get_board(slug, client_id=client_id)
-    except LookupError:
-        raise HTTPException(status_code=404, detail="PLE not found") from None
-
-
-@app.post("/ple/sync", response_model=PleBoardSchema, response_model_by_alias=True)
-async def sync_ple_event(payload: PleEventSyncSchema, db: AsyncSession = Depends(get_db)):
-    return await PleController(db).sync_event(payload)
-
-
-@app.post(
-    "/ple/{slug}/sync-from-client",
-    response_model=PleBoardSchema,
-    response_model_by_alias=True,
-)
-async def sync_ple_from_client_cards(
-    slug: str,
-    payload: PleEventSyncSchema,
-    db: AsyncSession = Depends(get_db),
-):
-    if payload.slug != slug:
-        raise HTTPException(status_code=400, detail="slug in path and body must match")
-    return await PleController(db).sync_event(payload)
-
-
-@app.post(
-    "/ple/{slug}/matches/{match_key}/predict",
-    response_model=PleBoardSchema,
-    response_model_by_alias=True,
-)
-async def ple_predict(
-    slug: str,
-    match_key: str,
-    body: PredictionRequestSchema,
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        return await PleController(db).predict(slug, match_key, body)
-    except LookupError:
-        raise HTTPException(status_code=404, detail="PLE or match not found") from None
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
-
-
-@app.patch(
-    "/ple/{slug}/matches/{match_key}/result",
-    response_model=PleBoardSchema,
-    response_model_by_alias=True,
-)
-async def ple_set_result(
-    slug: str,
-    match_key: str,
-    body: MatchResultUpdateSchema,
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        return await PleController(db).set_result(slug, match_key, body)
-    except LookupError:
-        raise HTTPException(status_code=404, detail="PLE or match not found") from None
-
-
-@app.post("/ple/{slug}/finalize", response_model=PleBoardSchema, response_model_by_alias=True)
-async def ple_finalize(slug: str, db: AsyncSession = Depends(get_db)):
-    try:
-        return await PleController(db).finalize(slug)
-    except LookupError:
-        raise HTTPException(status_code=404, detail="PLE not found") from None
-
-
-@app.get("/ple/{slug}/live")
-async def ple_live_board(slug: str, client_id: str | None = None):
-    """SSE — 투표·결과 변경 시 3초 주기로 보드 스냅샷 전송."""
-
-    if AsyncSessionLocal is None:
-        raise HTTPException(
-            status_code=503,
-            detail="DATABASE_URL이 설정되지 않았습니다.",
-        )
-
-    async def event_stream():
-        last_payload: str | None = None
-        while True:
-            async with AsyncSessionLocal() as session:
-                try:
-                    board = await PleController(session).get_board(slug, client_id=client_id)
-                    await session.commit()
-                except LookupError:
-                    yield f"data: {json.dumps({'error': 'not_found'})}\n\n"
-                    break
-                except Exception as e:
-                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                    await asyncio.sleep(3)
-                    continue
-
-            payload = json.dumps(
-                board.model_dump(mode="json", by_alias=True),
-                default=str,
-            )
-            if payload != last_payload:
-                yield f"data: {payload}\n\n"
-                last_payload = payload
-            await asyncio.sleep(3)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
 @app.post("/login", response_model=LoginResponse)
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     login_id = req.user_id.strip()
-    logger.info("[API] login 요청 — userId=%s", login_id)
+    logger.info("[API] POST /login — userId=%s", login_id)
 
     user_controller = UserController(db)
     user = await user_controller.login_user(login_id, req.password)
@@ -408,4 +294,13 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    # Windows: --reload 시 WatchFiles가 프로세스를 끊을 때 forrtl/libifcoremd 충돌 발생
+    use_reload = sys.platform != "win32"
+
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=use_reload,
+        loop="asyncio",
+    )

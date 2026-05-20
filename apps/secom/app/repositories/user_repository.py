@@ -1,11 +1,11 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import APP_LOGGER
+from database import LAYER_LOG
 from secom.app.models.user_model import UserModel
 from secom.app.schemas.user_schema import UserSchema
 
-logger = APP_LOGGER
+logger = LAYER_LOG
 
 
 class UserRepository(object):
@@ -13,39 +13,48 @@ class UserRepository(object):
         self.db = db
 
     async def _flush_to_neon(self) -> None:
-        """변경 사항을 즉시 Neon Postgres에 반영합니다 (flush → commit)."""
+        """변경 사항을 세션에 반영합니다 (commit은 get_db에서 처리)."""
         await self.db.flush()
-        await self.db.commit()
 
     async def find_by_email(self, email: str) -> UserModel | None:
         logger.info(
-            "[UserRepository] save_user 레이어 완료 — email=%s",
+            "[UserRepository] find_by_email -> Neon — email=%s",
             email,
         )
-        logger.info("[UserRepository] SELECT email=%s", email)
         result = await self.db.execute(
             select(UserModel).where(UserModel.email == email)
         )
-        return result.scalar_one_or_none()
+        user = result.scalar_one_or_none()
+        if user is None:
+            logger.info(
+                "[UserRepository] find_by_email <- Neon — email=%s, user=없음",
+                email,
+            )
+        else:
+            logger.info(
+                "[UserRepository] find_by_email <- Neon — email=%s, user=%s",
+                email,
+                user.to_log_dict(),
+            )
+        return user
 
     async def find_by_login_id(self, login_id: str) -> UserModel | None:
         logger.info(
-            "[UserRepository] login_user 레이어 완료 — userId=%s",
+            "[UserRepository] find_by_login_id -> Neon — userId=%s",
             login_id,
         )
-        logger.info("[UserRepository] SELECT login_id=%s", login_id)
         result = await self.db.execute(
             select(UserModel).where(UserModel.login_id == login_id)
         )
         user = result.scalar_one_or_none()
         if user is None:
             logger.info(
-                "[UserRepository] find_by_login_id — userId=%s, user=없음",
+                "[UserRepository] find_by_login_id <- Neon — userId=%s, user=없음",
                 login_id,
             )
         else:
             logger.info(
-                "[UserRepository] find_by_login_id — userId=%s, user=%s",
+                "[UserRepository] find_by_login_id <- Neon — userId=%s, user=%s",
                 login_id,
                 user.to_log_dict(),
             )
@@ -53,7 +62,7 @@ class UserRepository(object):
 
     async def save_user(self, user_schema: UserSchema, password_hash: str) -> UserModel:
         logger.info(
-            "[UserRepository] INSERT 준비 — userId=%s, email=%s",
+            "[UserRepository] save_user -> Neon — userId=%s, email=%s",
             user_schema.login_id,
             user_schema.email,
         )
@@ -68,8 +77,9 @@ class UserRepository(object):
         await self._flush_to_neon()
         await self.db.refresh(user)
         logger.info(
-            "[UserRepository] Neon 저장 완료 (COMMIT) — userId=%s, db_id=%s",
+            "[UserRepository] save_user <- Neon — userId=%s, db_id=%s, user=%s",
             user_schema.login_id,
             user.id,
+            user.to_log_dict(),
         )
         return user
