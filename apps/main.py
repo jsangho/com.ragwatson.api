@@ -33,6 +33,10 @@ from secom.app.models.role import UserRole
 from secom.app.schemas.user_schema import UserSchema
 from secom.app.controllers.user_controller import UserController
 from titanic.app.james_controller import JamesController
+from kayfabe.app.controllers.ple_controller import PleController
+from kayfabe.app.schemas.ple_schema import PleBoard, PredictRequest, SetResultRequest, SyncFromClientRequest
+from kayfabe.app.controllers.result_controller import ResultController
+from kayfabe.app.schemas.result_schema import PleResultsResponse
 
 keymaker = get_keymaker()
 logger = logging.getLogger("uvicorn.error")
@@ -251,6 +255,93 @@ def read_doro_data():
 
     return df.to_dict(orient="records")
 
+
+@app.get("/ple/{slug}", response_model=PleBoard)
+async def get_ple_board(
+    slug: str,
+    client_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    controller = PleController(db)
+    try:
+        return await controller.get_board(slug, client_id=client_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="PLE not found")
+
+
+@app.post("/ple/{slug}/sync-from-client", response_model=PleBoard)
+async def sync_ple_from_client(
+    slug: str,
+    req: SyncFromClientRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    payload = req.model_copy(update={"slug": slug})
+    controller = PleController(db)
+    return await controller.sync_from_client(payload)
+
+
+@app.post("/ple/{slug}/matches/{match_key}/predict", response_model=PleBoard)
+async def predict_ple_match(
+    slug: str,
+    match_key: str,
+    req: PredictRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    controller = PleController(db)
+    try:
+        return await controller.predict(
+            slug=slug,
+            match_key=match_key,
+            client_id=req.clientId,
+            pick=req.pick,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="PLE not found")
+
+
+@app.post("/ple/{slug}/matches/{match_key}/result", response_model=PleBoard)
+async def set_ple_match_result(
+    slug: str,
+    match_key: str,
+    req: SetResultRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    controller = PleController(db)
+    try:
+        return await controller.set_result(slug, match_key, req)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="PLE not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/ple/{slug}/live")
+async def ple_live(
+    slug: str,
+    client_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    controller = PleController(db)
+
+    async def gen():
+        try:
+            async for chunk in controller.live_stream(slug, client_id):
+                yield chunk
+        except Exception as e:
+            payload = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/results", response_model=PleResultsResponse)
+async def list_ple_results(
+    year: int = 2026,
+    db: AsyncSession = Depends(get_db),
+):
+    controller = ResultController(db)
+    return await controller.list_results(year)
+
 #회원가입
 @app.post("/signup", response_model=SignupResponse)
 async def signup(req: SignupRequest, db: AsyncSession = Depends(get_db)):
@@ -258,7 +349,7 @@ async def signup(req: SignupRequest, db: AsyncSession = Depends(get_db)):
     user_schema = UserSchema(
         login_id=req.user_id.strip(),
         nickname=req.nickname,
-        email=req.email,
+        email=req.email, 
         password=req.password,
         password_confirm=req.password_confirm,
         role=UserRole.USER,

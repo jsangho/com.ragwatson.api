@@ -3,6 +3,7 @@ import logging
 import os
 import selectors
 import sys
+from datetime import datetime, timezone
 from collections.abc import AsyncGenerator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -172,6 +173,8 @@ async def init_db() -> None:
         return
 
     import secom.app.models.user_model  # noqa: F401
+    import kayfabe.app.models.ple_model  # noqa: F401
+    import kayfabe.app.models.result_model  # noqa: F401
 
     await warmup_db_pool()
 
@@ -192,6 +195,130 @@ async def init_db() -> None:
                 "ON users (login_id) WHERE login_id IS NOT NULL"
             )
         )
+
+        # KayFabe PLE 메타 시드 (slug 기준 upsert)
+        await conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS ples ("
+                "id SERIAL PRIMARY KEY, "
+                "slug VARCHAR(64) NOT NULL UNIQUE, "
+                "month INTEGER NOT NULL, "
+                "label VARCHAR(128) NOT NULL, "
+                "description VARCHAR(512) NOT NULL, "
+                "year INTEGER NOT NULL DEFAULT 2026, "
+                "event_at TIMESTAMP WITH TIME ZONE NULL, "
+                "created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL"
+                ")"
+            )
+        )
+        await conn.execute(
+            text("ALTER TABLE ples ADD COLUMN IF NOT EXISTS event_at TIMESTAMP WITH TIME ZONE")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_ples_month ON ples (month)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_ples_year ON ples (year)")
+        )
+
+        # 기존 DB에서도 kayfabe 테이블 스키마를 점진적으로 맞춥니다.
+        # (create_all은 기존 테이블 컬럼 추가/변경을 하지 않음)
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS ple_id INTEGER")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS match_key VARCHAR(128)")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS title VARCHAR(255)")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS card_variant VARCHAR(16)")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS format VARCHAR(16)")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS status VARCHAR(16)")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS \"left\" JSON")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS \"right\" JSON")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS competitors JSON")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS bookmaker_decimal JSON")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS result_winner VARCHAR(255)")
+        )
+        await conn.execute(
+            text("ALTER TABLE ple_matches ADD COLUMN IF NOT EXISTS result_pick VARCHAR(32)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_ple_matches_ple_id ON ple_matches (ple_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_ple_matches_match_key ON ple_matches (match_key)")
+        )
+
+        # 개최일(event_at)은 UTC 기준 datetime으로 저장합니다.
+        # 확정되지 않은 일정은 None으로 두어 자동 finished가 발생하지 않게 합니다.
+        event_at_by_slug: dict[str, datetime | None] = {
+            "royal-rumble": datetime(2026, 1, 31, tzinfo=timezone.utc),
+            "elimination-chamber": datetime(2026, 2, 28, tzinfo=timezone.utc),
+            "wrestlemania": datetime(2026, 4, 18, tzinfo=timezone.utc),  # 4/18~4/19 → 시작일 기준
+            "backlash": datetime(2026, 5, 9, tzinfo=timezone.utc),
+            "money-in-the-bank": datetime(2026, 9, 6, tzinfo=timezone.utc),
+            "summerslam": datetime(2026, 8, 1, tzinfo=timezone.utc),  # 8/1~8/2 → 시작일 기준
+            "survivor-series": datetime(2026, 11, 28, tzinfo=timezone.utc),
+            # 아래는 프론트 목록에는 아직 없지만, 일정만 보관할 수 있도록 남겨둠
+            "clash-in-italy": datetime(2026, 5, 31, tzinfo=timezone.utc),
+            "night-of-champions": datetime(2026, 6, 27, tzinfo=timezone.utc),
+            "crown-jewel": None,  # 11-xx 미확정
+        }
+
+        ple_seeds = [
+            (1, "royal-rumble", "Royal Rumble", "30인 룰렛 매치로 WrestleMania 출전권을 가르는 시즌 오프닝"),
+            (2, "elimination-chamber", "Elimination Chamber", "철장 안 6인 엘리미네이션 챔버로 챔피언을 결정"),
+            (3, "stand-and-deliver", "Stand & Deliver", "NXT의 플래그십 PLE, 차세대 스타들의 무대"),
+            (4, "wrestlemania", "WrestleMania 42", "WWE 최대의 쇼, 한 해의 클라이맥스"),
+            (5, "backlash", "Backlash", "WrestleMania 직후 스토리가 이어지는 첫 메이저 PPV"),
+            (6, "money-in-the-bank", "Money in the Bank", "서류가방 래더 매치로 언제든 타이틀 도전권 획득"),
+            (7, "king-queen-of-the-ring", "King & Queen of the Ring", "싱글 토너먼트로 왕·여왕을 가리는 중세 테마 PLE"),
+            (8, "summerslam", "SummerSlam", "여름 최대 PLE, 빅 매치와 라이벌의 절정"),
+            (9, "bash-in-berlin", "Bash in Berlin", "독일 베를린에서 열리는 국제 스펙터클 이벤트"),
+            (10, "bad-blood", "Bad Blood", "헬 인 어 셀 중심의 격렬한 페우드 클리맥스"),
+            (11, "survivor-series", "Survivor Series: WarGames", "서바이버 시리즈: 워게임즈로 시즌을 마무리"),
+        ]
+        for month, slug, label, description in ple_seeds:
+            await conn.execute(
+                text(
+                    "INSERT INTO ples (slug, month, label, description, year, event_at) "
+                    "VALUES (:slug, :month, :label, :description, 2026, :event_at) "
+                    "ON CONFLICT (slug) DO UPDATE SET "
+                    "month = EXCLUDED.month, "
+                    "label = EXCLUDED.label, "
+                    "description = EXCLUDED.description, "
+                    "year = EXCLUDED.year, "
+                    "event_at = EXCLUDED.event_at"
+                ),
+                {
+                    "slug": slug,
+                    "month": month,
+                    "label": label,
+                    "description": description,
+                    # slug별 확정된 개최일이 있으면 그 값을 사용
+                    "event_at": event_at_by_slug.get(slug) or datetime(2026, month, 1, tzinfo=timezone.utc),
+                },
+            )
+
+        # PLE 결과(ple_results)는 자동 생성하지 않습니다.
+        # 운영자/API가 직접 status/finished_at을 기입하는 것을 원칙으로 합니다.
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
