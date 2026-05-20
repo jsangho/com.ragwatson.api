@@ -1,6 +1,6 @@
-# com.ragwatson
+# cloud.jsangho
 
-문서·실습 코드 등을 한곳에 모아 둔 **워크스페이스**다. 하위에 `agora/`(예: `vote.tjwatson` 앱), `docs/`(Obsidian 등 노트) 등이 있다.
+문서·실습 코드 등을 한곳에 모아 둔 **워크스페이스**다. 하위에 `kayfabe/`(예: `gorilla/jsangho` 앱), `docs/`(Obsidian 등 노트) 등이 있다.
 
 ---
 
