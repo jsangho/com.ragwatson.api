@@ -32,7 +32,15 @@ from matrix.app.keymaker import get_keymaker
 from secom.app.models.role import UserRole
 from secom.app.schemas.user_schema import UserSchema
 from secom.app.controllers.user_controller import UserController
-from titanic.app.james_controller import JamesController
+from titanic.app.controllers.passenger_controller import PassengerController
+from kayfabe.app.controllers.ple_controller import PleController
+from kayfabe.app.schemas.ple_schema import (
+    MatchResultUpdateSchema,
+    PleBoardSchema,
+    PleEventSummarySchema,
+    PleEventSyncSchema,
+    PredictionRequestSchema,
+)
 
 keymaker = get_keymaker()
 logger = logging.getLogger("uvicorn.error")
@@ -216,32 +224,158 @@ async def check_db(db: AsyncSession = Depends(get_db)):
 
 @app.get("/titanic/data")
 def read_titanic_data():
-    james = JamesController()
-    df = james.get_data()
-
+    controller = PassengerController()
+    df = controller.get_data()
     return df.to_dict(orient="records")
 
 
 @app.get("/titanic/count")
 def read_titanic_count():
-    james = JamesController()
-    count = james.get_count()
-
+    controller = PassengerController()
+    count = controller.get_count()
     return {"count": count}
+
+
+@app.get("/titanic/problem")
+def read_titanic_problem():
+    controller = PassengerController()
+    return {"summary": controller.get_problem_summary()}
+
 
 @app.get("/titanic/tree")
 def read_titanic_tree():
-    james = JamesController()
-    tree = james.has_decision_tree_model()
-
+    controller = PassengerController()
+    tree = controller.has_decision_tree_model()
     return {"tree": tree}
 
 
 @app.get("/titanic/model")
 def read_titanic_model():
-    controller = JamesController()
+    controller = PassengerController()
     model_name = controller.get_model_name_and_accuracy()
     return JSONResponse(content=jsonable_encoder(model_name))
+
+
+def _ple_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, LookupError):
+        return HTTPException(status_code=404, detail=str(exc) or "Not found")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    raise exc
+
+
+@app.get(
+    "/ple/events",
+    response_model=list[PleEventSummarySchema],
+    response_model_by_alias=True,
+)
+async def list_ple_events(db: AsyncSession = Depends(get_db)):
+    """Neon에 동기화된 PLE 이벤트 목록."""
+    return await PleController(db).list_events()
+
+
+@app.get(
+    "/ple/{slug}",
+    response_model=PleBoardSchema,
+    response_model_by_alias=True,
+)
+async def get_ple_board(
+    slug: str,
+    client_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """PLE 경기 보드(카드·사이트 투표·내 예측)."""
+    try:
+        return await PleController(db).get_board(slug, client_id=client_id)
+    except LookupError as e:
+        raise _ple_http_error(e) from e
+
+
+@app.post(
+    "/ple/{slug}/sync-from-client",
+    response_model=PleBoardSchema,
+    response_model_by_alias=True,
+)
+async def sync_ple_from_client(
+    slug: str,
+    payload: PleEventSyncSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    """프론트 매치 카드를 Neon에 upsert."""
+    if payload.slug != slug:
+        raise HTTPException(status_code=400, detail="URL slug와 본문 slug가 일치하지 않습니다.")
+    try:
+        return await PleController(db).sync_event(payload)
+    except ValueError as e:
+        raise _ple_http_error(e) from e
+
+
+@app.post(
+    "/ple/{slug}/matches/{match_key}/predict",
+    response_model=PleBoardSchema,
+    response_model_by_alias=True,
+)
+async def predict_ple_match(
+    slug: str,
+    match_key: str,
+    body: PredictionRequestSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    """경기 예측 1회 저장 (Neon ple_predictions)."""
+    try:
+        return await PleController(db).predict(slug, match_key, body)
+    except (LookupError, ValueError) as e:
+        raise _ple_http_error(e) from e
+
+
+@app.post(
+    "/ple/{slug}/matches/{match_key}/result",
+    response_model=PleBoardSchema,
+    response_model_by_alias=True,
+)
+async def set_ple_match_result(
+    slug: str,
+    match_key: str,
+    body: MatchResultUpdateSchema,
+    db: AsyncSession = Depends(get_db),
+):
+    """경기 결과 등록·갱신 (Neon ple_matches)."""
+    try:
+        return await PleController(db).set_result(slug, match_key, body)
+    except (LookupError, ValueError) as e:
+        raise _ple_http_error(e) from e
+
+
+@app.get("/ple/{slug}/live")
+async def ple_live_board(slug: str, client_id: str):
+    """보드 스냅샷 SSE (예측·결과 반영)."""
+
+    async def event_stream():
+        while True:
+            if AsyncSessionLocal is None:
+                yield f"data: {json.dumps({'error': 'DATABASE_URL not configured'})}\n\n"
+                break
+            try:
+                async with AsyncSessionLocal() as session:
+                    board = await PleController(session).get_board(
+                        slug, client_id=client_id
+                    )
+                    if session.new or session.dirty or session.deleted:
+                        await session.commit()
+                    elif session.in_transaction():
+                        await session.rollback()
+                payload = board.model_dump(mode="json", by_alias=True)
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
+            except LookupError as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                break
+            await asyncio.sleep(3)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
 @app.get("/doro/data")
